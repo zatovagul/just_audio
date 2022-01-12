@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:audio_session/audio_session.dart';
 import 'package:crypto/crypto.dart';
@@ -73,6 +74,12 @@ class AudioPlayer {
   /// subscribe to the new platform's events.
   StreamSubscription? _playerDataSubscription;
 
+  /// The subscription to the event channel for waveform data.
+  StreamSubscription? _visualizerWaveformSubscription;
+
+  /// The subscription to the event channel for FFT data.
+  StreamSubscription? _visualizerFftSubscription;
+
   final String _id;
   final _proxy = _ProxyHttpServer();
   AudioSource? _audioSource;
@@ -80,9 +87,13 @@ class AudioPlayer {
   bool _disposed = false;
   _InitialSeekValues? _initialSeekValues;
   final AudioPipeline _audioPipeline;
+  StartVisualizerRequest? _startVisualizerRequest;
 
   PlaybackEvent _playbackEvent = PlaybackEvent();
   final _playbackEventSubject = BehaviorSubject<PlaybackEvent>(sync: true);
+  final _visualizerWaveformSubject =
+      BehaviorSubject<VisualizerWaveformCapture>();
+  final _visualizerFftSubject = BehaviorSubject<VisualizerFftCapture>();
   Future<Duration?>? _durationFuture;
   final _durationSubject = BehaviorSubject<Duration?>();
   final _processingStateSubject = BehaviorSubject<ProcessingState>();
@@ -300,6 +311,14 @@ class AudioPlayer {
 
   /// A stream of [PlaybackEvent]s.
   Stream<PlaybackEvent> get playbackEventStream => _playbackEventSubject.stream;
+
+  /// A stream of visualizer waveform data in unsigned 8 bit PCM..
+  Stream<VisualizerWaveformCapture> get visualizerWaveformStream =>
+      _visualizerWaveformSubject.stream;
+
+  /// A stream of visualizer FFT data.
+  Stream<VisualizerFftCapture> get visualizerFftStream =>
+      _visualizerFftSubject.stream;
 
   /// The duration of the current audio or `null` if unknown.
   Duration? get duration => _playbackEvent.duration;
@@ -1083,11 +1102,41 @@ class AudioPlayer {
         usage: audioAttributes.usage.value));
   }
 
+  /// Start the visualizer by capturing [captureSize] samples of audio at
+  /// [captureRate] millihertz. If [enableWaveform] is `true`, the captured
+  /// samples will be broadcast via [visualizerWaveformStream]. If [enableFft]
+  /// is `true`, the FFT data for each capture will be broadcast via
+  /// [visualizerFftStream]. You should call [stopVisualizer] to stop capturing
+  /// audio data.
+  Future<void> startVisualizer({
+    bool enableWaveform = true,
+    bool enableFft = true,
+    int? captureRate,
+    int? captureSize,
+  }) async {
+    await (await _platform).startVisualizer(_startVisualizerRequest =
+        StartVisualizerRequest(
+            enableWaveform: enableWaveform,
+            enableFft: enableFft,
+            captureRate: captureRate,
+            captureSize: captureSize));
+  }
+
+  /// Stop capturing audio data for the visualizer.
+  Future<void> stopVisualizer() async {
+    _startVisualizerRequest = null;
+    (await _platform).stopVisualizer(StopVisualizerRequest());
+  }
+
   /// Release all resources associated with this player. You must invoke this
   /// after you are done with the player.
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
+    await _visualizerWaveformSubscription?.cancel();
+    await _visualizerFftSubscription?.cancel();
+    await _visualizerWaveformSubject.close();
+    await _visualizerFftSubject.close();
     if (_nativePlatform != null) {
       await _disposePlatform(await _nativePlatform!);
       _nativePlatform = null;
@@ -1237,11 +1286,26 @@ class AudioPlayer {
           _setPlatformActive(false)?.catchError((dynamic e) {});
         }
       }, onError: _playbackEventSubject.addError);
+      _visualizerWaveformSubscription =
+          platform.visualizerWaveformStream.listen((message) {
+        _visualizerWaveformSubject.add(VisualizerWaveformCapture(
+          samplingRate: message.samplingRate,
+          data: message.data,
+        ));
+      });
+      _visualizerFftSubscription = platform.visualizerFftStream
+          .listen((message) => _visualizerFftSubject.add(VisualizerFftCapture(
+                samplingRate: message.samplingRate,
+                data: message.data,
+              )));
     }
 
     Future<AudioPlayerPlatform> setPlatform() async {
       _playbackEventSubscription?.cancel();
       _playerDataSubscription?.cancel();
+      _visualizerWaveformSubscription?.cancel();
+      _visualizerFftSubscription?.cancel();
+
       if (!force) {
         final oldPlatform = _platformValue!;
         if (!(oldPlatform is _IdleAudioPlayer)) {
@@ -1305,6 +1369,9 @@ class AudioPlayer {
               SetAutomaticallyWaitsToMinimizeStallingRequest(
                   enabled: automaticallyWaitsToMinimizeStalling));
           if (checkInterruption()) return platform;
+        }
+        if (_startVisualizerRequest != null) {
+          await platform.startVisualizer(_startVisualizerRequest!);
         }
         await platform.setVolume(SetVolumeRequest(volume: volume));
         if (checkInterruption()) return platform;
@@ -1427,6 +1494,34 @@ class PlayerInterruptedException implements Exception {
 
   @override
   String toString() => "$message";
+}
+
+/// A capture of audio waveform data.
+class VisualizerWaveformCapture {
+  /// The sampling rate of the capture.
+  final int samplingRate;
+
+  /// The waveform data.
+  final Uint8List data;
+
+  VisualizerWaveformCapture({
+    required this.samplingRate,
+    required this.data,
+  });
+}
+
+/// A capture of audio FFT data.
+class VisualizerFftCapture {
+  /// The sampling rate of the capture.
+  final int samplingRate;
+
+  /// The FFT data.
+  final Uint8List data;
+
+  VisualizerFftCapture({
+    required this.samplingRate,
+    required this.data,
+  });
 }
 
 /// Encapsulates the playback state and current position of the player.
@@ -3188,6 +3283,9 @@ enum LoopMode { off, one, all }
 /// state and the native platform is deallocated.
 class _IdleAudioPlayer extends AudioPlayerPlatform {
   final _eventSubject = BehaviorSubject<PlaybackEventMessage>();
+  final _visualizerWaveformSubject =
+      BehaviorSubject<VisualizerWaveformCaptureMessage>();
+  final _visualizerFftSubject = BehaviorSubject<VisualizerFftCaptureMessage>();
   late Duration _position;
   int? _index;
   List<IndexedAudioSource>? _sequence;
@@ -3224,6 +3322,14 @@ class _IdleAudioPlayer extends AudioPlayerPlatform {
   @override
   Stream<PlaybackEventMessage> get playbackEventMessageStream =>
       _eventSubject.stream;
+
+  @override
+  Stream<VisualizerWaveformCaptureMessage> get visualizerWaveformStream =>
+      _visualizerWaveformSubject.stream;
+
+  @override
+  Stream<VisualizerFftCaptureMessage> get visualizerFftStream =>
+      _visualizerFftSubject.stream;
 
   @override
   Future<LoadResponse> load(LoadRequest request) async {
@@ -3338,6 +3444,18 @@ class _IdleAudioPlayer extends AudioPlayerPlatform {
   Future<ConcatenatingMoveResponse> concatenatingMove(
       ConcatenatingMoveRequest request) async {
     return ConcatenatingMoveResponse();
+  }
+
+  @override
+  Future<StartVisualizerResponse> startVisualizer(
+      StartVisualizerRequest request) async {
+    return StartVisualizerResponse();
+  }
+
+  @override
+  Future<StopVisualizerResponse> stopVisualizer(
+      StopVisualizerRequest request) async {
+    return StopVisualizerResponse();
   }
 
   @override
