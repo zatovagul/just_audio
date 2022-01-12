@@ -21,7 +21,7 @@ dependencies:
 #      ref: master
 #      path: just_audio_web
 #  just_audio_web: ^0.4.2
-  just_audio_web:
+  just_audio_web_temirlan:
     path: ../just_audio_web
   audio_session: ^0.1.6+1
   rxdart: '>=0.26.0 <0.28.0'
